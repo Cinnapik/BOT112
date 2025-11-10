@@ -1,28 +1,27 @@
 # utils.py
-# Небольшие утилиты: генерация номера заявки и сохранение файлов
+# Всякая полезная мелочь, чтобы не плодить код в main.py.
 
-import datetime
+from datetime import datetime
 from pathlib import Path
+from config import FILES_DIR
 
-BASE = Path(__file__).parent
-FILES = BASE / "files"
-FILES.mkdir(parents=True, exist_ok=True)
-
-def gen_ticket():
+def gen_ticket() -> str:
     """
-    Простая генерация тикета: T + YYYYMMDDHHMMSSmmm
-    Возвращает строку.
+    Генерируем удобный номер заявки по времени (UTC).
+    Формат: TYYYYMMDDHHMMSSmmm (T + дата-время + миллисекунды)
+    Пример: T20251110152312001
     """
-    now = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[:-3]
-    return "T" + now
+    now = datetime.utcnow()
+    return "T" + now.strftime("%Y%m%d%H%M%S") + f"{int(now.microsecond/1000):03d}"
 
 def save_file_bytes(data: bytes, filename: str) -> str:
     """
-    Сохранить байты в папку files и вернуть путь к файлу (строка).
-    Пример filename: "123_photo.jpg"
+    Сохраняем байты в папку ./files и возвращаем путь.
+    Сейчас не используется, но место готово, если добавим медиа/документы.
     """
-    safe = filename.replace("/", "_").replace("\\", "_")
-    path = FILES / safe
+    folder = Path(FILES_DIR)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / filename
     with open(path, "wb") as f:
         f.write(data)
     return str(path)
