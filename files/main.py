@@ -1,14 +1,11 @@
 # main.py
-# Главный файл бота. Здесь хендлеры команд/кнопок и запуск приложения.
-# Бот делает три вещи:
-#  1) Создать заявку (пользователь)
-#  2) Посмотреть мои заявки (пользователь)
-#  3) Открыть заявку, изменить статус и ОТВЕТИТЬ пользователю (админ)
+# Главный файл бота
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, List, Tuple
 
+import aiosqlite
 from telegram import (
     Update,
     ReplyKeyboardMarkup, KeyboardButton,
@@ -20,7 +17,7 @@ from telegram.ext import (
     filters
 )
 
-from config import BOT_TOKEN, ADMIN_SECRET, FILES_DIR
+from config import BOT_TOKEN, ADMIN_SECRET, FILES_DIR, DB_PATH
 from utils import gen_ticket
 from db import (
     init_db, create_user, set_admin, list_admins,
@@ -28,19 +25,61 @@ from db import (
     save_reply, list_replies
 )
 
-# Включаем логирование (полезно для отладки)
-logging.basicConfig(level=logging.INFO)
+# ========= ЛОГИ =========
+# Базовая конфигурация логов
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s"
+)
+# Уберём болтливые строки httpx вида "INFO:httpx:HTTP Request: POST ..."
+logging.getLogger("httpx").setLevel(logging.WARNING)
+# (опционально) приглушим сторонние подробности от urllib3 внутри telegram
+logging.getLogger("telegram.vendor.ptb_urllib3.urllib3").setLevel(logging.WARNING)
+
 log = logging.getLogger("bot")
 
-# Кнопки главного меню (простые и понятные)
+
+# ========= КНОПКИ =========
+
 BTN_CREATE = "Создать обращение"
 BTN_MY = "Мои обращения"
 BTN_HELP = "Справка"
+BTN_ADMIN = "Админ-меню"
 
+# внутри админ-меню
+BTN_ADMIN_NEW = "Новые заявки (5)"
+BTN_ADMIN_FIND = "Открыть по тикету"
+BTN_BACK = "Назад"
+
+# Обычная клавиатура (для не-админа)
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton(BTN_CREATE)], [KeyboardButton(BTN_MY)], [KeyboardButton(BTN_HELP)]],
     resize_keyboard=True
 )
+
+def make_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
+    """Динамическая клавиатура: обычная + кнопка 'Админ-меню' для админа."""
+    if not is_admin:
+        return MAIN_KEYBOARD
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_CREATE)],
+            [KeyboardButton(BTN_MY)],
+            [KeyboardButton(BTN_HELP)],
+            [KeyboardButton(BTN_ADMIN)],
+        ],
+        resize_keyboard=True
+    )
+
+def admin_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_ADMIN_NEW)],
+            [KeyboardButton(BTN_ADMIN_FIND)],
+            [KeyboardButton(BTN_BACK)],
+        ],
+        resize_keyboard=True
+    )
 
 
 # ======= ВСПОМОГАТЕЛЬНОЕ =======
@@ -50,19 +89,36 @@ def normalize(text: Optional[str]) -> str:
     return (text or "").strip().lower()
 
 
+async def admin_recent_requests(limit: int = 5) -> List[Tuple]:
+    """Последние N заявок (для админ-меню). Возвращает кортежи: (ticket, user_id, text, status, created_at)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT ticket, user_id, text, status, created_at
+            FROM requests
+            ORDER BY datetime(created_at) DESC
+            LIMIT ?
+            """,
+            (limit,)
+        )
+        return await cur.fetchall()
+
+
 # ======= КОМАНДЫ =======
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start — регистрируем юзера, показываем клавиатуру."""
     user = update.effective_user
     await create_user(user.id, user.username, user.first_name)
+    admins = await list_admins()
+    is_admin = user.id in admins
 
     await update.message.reply_text(
         "Привет! Это бот-тикетница.\n\n"
         "Нажми «Создать обращение», чтобы оставить заявку.\n"
         "«Мои обращения» — список твоих заявок.\n"
         "«Справка» — краткая помощь.",
-        reply_markup=MAIN_KEYBOARD
+        reply_markup=make_keyboard(is_admin)
     )
 
 
@@ -77,7 +133,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = args[1].strip()
     if code == ADMIN_SECRET:
         await set_admin(user.id)
-        await update.message.reply_text("Готово! Вы администратор.", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text("Готово! Вы администратор.", reply_markup=make_keyboard(True))
     else:
         await update.message.reply_text("Код неверный.", reply_markup=MAIN_KEYBOARD)
 
@@ -94,16 +150,52 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Всегда гарантируем, что юзер есть в БД
     await create_user(user.id, user.username, user.first_name)
+    admins = await list_admins()
+    is_admin = user.id in admins
+    kb = make_keyboard(is_admin)
+
+    # --- 0) Админ: ожидание ввода номера тикета для открытия карточки ---
+    if context.user_data.get("expect_ticket_to_open"):
+        context.user_data.pop("expect_ticket_to_open", None)
+        ticket = text.strip()
+        row = await get_request_by_ticket(ticket)
+        if not row:
+            await update.message.reply_text(f"Заявка {ticket} не найдена.", reply_markup=admin_keyboard() if is_admin else kb)
+            return
+
+        _id, ticket, user_id_author, rtext, media_path, lat, lon, status, admin_comment, created, updated = row
+
+        replies = await list_replies(ticket)
+        replies_block = ""
+        if replies:
+            last = replies[-1]
+            rid, rtext_last, rtime = last[0], last[1], last[2]
+            replies_block = f"\n\nПоследний ответ: {rtext_last}\n({rtime})"
+
+        msg = (
+            f"Заявка {ticket}\n"
+            f"Автор: {user_id_author}\n"
+            f"Создана: {created}\n"
+            f"Статус: {status}\n"
+            f"Текст:\n{rtext}{replies_block}"
+        )
+
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Ответить пользователю", callback_data=f"reply:{ticket}")],
+            [InlineKeyboardButton("В обработке", callback_data=f"status:{ticket}:В обработке"),
+             InlineKeyboardButton("Завершено", callback_data=f"status:{ticket}:Завершено")],
+            [InlineKeyboardButton("Отклонено", callback_data=f"status:{ticket}:Отклонено")]
+        ])
+        await update.message.reply_text(msg, reply_markup=buttons)
+        return
 
     # --- 1) Режим "админ отвечает пользователю" ---
-    # Админ нажал "Ответить пользователю 💬" → мы поставили флаг reply_to_ticket
     if context.user_data.get("reply_to_ticket"):
-        admins = await list_admins()
-        if user.id in admins:
+        if is_admin:
             ticket = context.user_data.pop("reply_to_ticket")
             req = await get_request_by_ticket(ticket)
             if not req:
-                await update.message.reply_text("Заявка не найдена.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("Заявка не найдена.", reply_markup=kb)
                 return
 
             # Извлекаем user_id автора заявки (в выборке он под индексом 2)
@@ -121,7 +213,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text(
                 f"Ответ отправлен пользователю (заявка {ticket}).",
-                reply_markup=MAIN_KEYBOARD
+                reply_markup=kb
             )
             return
         else:
@@ -129,7 +221,6 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("reply_to_ticket", None)
 
     # --- 2) Создание заявки (пользователь сначала нажимает кнопку) ---
-    # Если флаг awaiting_request = True → следующее сообщение считаем текстом заявки
     if context.user_data.get("awaiting_request"):
         context.user_data.pop("awaiting_request", None)  # сбрасываем флаг
         ticket = gen_ticket()
@@ -138,11 +229,10 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Сообщаем автору номер его заявки
         await update.message.reply_text(
             f"Заявка принята! Номер: {ticket}\nМы сообщили администраторам.",
-            reply_markup=MAIN_KEYBOARD
+            reply_markup=kb
         )
 
         # Шлём уведомление всем админам (если они есть)
-        admins = await list_admins()
         if admins:
             buttons = InlineKeyboardMarkup([
                 [InlineKeyboardButton("Открыть заявку", callback_data=f"open:{ticket}")]
@@ -162,31 +252,28 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     low = normalize(text)
 
     if low == normalize(BTN_CREATE):
-        # Ставим флаг: следующее сообщение пользователя = текст заявки
         context.user_data["awaiting_request"] = True
         await update.message.reply_text(
             "Напишите текст вашей заявки одним сообщением.\n(Фото/доки можно добавить позже — логика уже заложена)",
-            reply_markup=MAIN_KEYBOARD
+            reply_markup=kb
         )
         return
 
     if low == normalize(BTN_MY):
-        # Покажем короткий список заявок пользователя
         rows = await list_user_requests(user.id)
         if not rows:
-            await update.message.reply_text("У вас пока нет заявок.", reply_markup=MAIN_KEYBOARD)
+            await update.message.reply_text("У вас пока нет заявок.", reply_markup=kb)
             return
 
         lines = []
-        for r in rows[:10]:  # покажем максимум 10 последних, чтобы не засорять чат
+        for r in rows[:10]:
             _id, ticket, _uid, rtext, _mp, _lat, _lon, status, _cmt, created, _upd = r
-            # Сниппет делаем покороче, чтоб не растягивать
             snippet = (rtext[:60] + "…") if len(rtext) > 60 else rtext
             lines.append(f"{ticket} — {status} — {created}\n{snippet}")
 
         await update.message.reply_text(
             "Ваши последние заявки:\n\n" + "\n\n".join(lines),
-            reply_markup=MAIN_KEYBOARD
+            reply_markup=kb
         )
         return
 
@@ -196,15 +283,45 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "1) Нажмите «Создать обращение» и отправьте текст одним сообщением.\n"
             "2) Администратор откроет вашу заявку и ответит, либо поменяет статус.\n"
             "3) «Мои обращения» — список ваших заявок со статусами.",
-            reply_markup=MAIN_KEYBOARD
+            reply_markup=kb
         )
+        return
+
+    # === АДМИН-МЕНЮ ===
+    if low == normalize(BTN_ADMIN) and is_admin:
+        await update.message.reply_text("Админ-меню:", reply_markup=admin_keyboard())
+        return
+
+    if is_admin and low == normalize(BTN_ADMIN_NEW):
+        rows = await admin_recent_requests(limit=5)
+        if not rows:
+            await update.message.reply_text("Заявок пока нет.", reply_markup=admin_keyboard())
+            return
+
+        # Отправим по одному сообщению на заявку с кнопкой «Открыть»
+        for ticket, uid, rtext, status, created in rows:
+            snippet = (rtext[:160] + "…") if len(rtext) > 160 else rtext
+            msg = f"Заявка {ticket} — {status}\nАвтор: {uid}\nСоздана: {created}\n\n{snippet}"
+            buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Открыть", callback_data=f"open:{ticket}")]])
+            await update.message.reply_text(msg, reply_markup=buttons)
+        # И вернём клавиатуру админа
+        await update.message.reply_text("Готово.", reply_markup=admin_keyboard())
+        return
+
+    if is_admin and low == normalize(BTN_ADMIN_FIND):
+        context.user_data["expect_ticket_to_open"] = True
+        await update.message.reply_text("Введите номер тикета (например: T20251110152312001):", reply_markup=admin_keyboard())
+        return
+
+    if is_admin and low == normalize(BTN_BACK):
+        await update.message.reply_text("Возврат в главное меню.", reply_markup=kb)
         return
 
     # Если это что-то непонятное — подскажем, куда нажать
     await update.message.reply_text(
         "Нажмите «Создать обращение», чтобы оставить заявку.\n"
         "Или «Мои обращения», чтобы посмотреть статусы.",
-        reply_markup=MAIN_KEYBOARD
+        reply_markup=kb
     )
 
 
@@ -246,7 +363,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Ответить пользователю 💬", callback_data=f"reply:{ticket}")],
+            [InlineKeyboardButton("Ответить пользователю", callback_data=f"reply:{ticket}")],
             [InlineKeyboardButton("В обработке", callback_data=f"status:{ticket}:В обработке"),
              InlineKeyboardButton("Завершено", callback_data=f"status:{ticket}:Завершено")],
             [InlineKeyboardButton("Отклонено", callback_data=f"status:{ticket}:Отклонено")]
