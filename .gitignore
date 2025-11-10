@@ -1,0 +1,9 @@
+# Python
+pycache/
+*.pyc
+.venv/
+.env
+
+# Project data
+bot.db
+files/
