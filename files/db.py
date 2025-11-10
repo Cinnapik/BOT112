@@ -11,18 +11,18 @@ import aiosqlite
 
 from config import DB_PATH
 
-# Типы для удобства (не обязательно, но понятнее)
+# Типы для удобства
 UserRow = Tuple[int, Optional[str], Optional[str], int]
 RequestRow = Tuple[
     int,      # id
     str,      # ticket
     int,      # user_id
     str,      # text
-    Optional[str],  # media_path
-    Optional[float],# latitude
-    Optional[float],# longitude
+    Optional[str],   # media_path
+    Optional[float], # latitude
+    Optional[float], # longitude
     str,      # status
-    Optional[str],  # admin_comment
+    Optional[str],   # admin_comment
     str,      # created_at
     str       # updated_at
 ]
@@ -96,6 +96,14 @@ async def list_admins() -> List[int]:
     return [r[0] for r in rows]
 
 
+async def list_all_user_ids() -> List[int]:
+    """Список всех пользователей, писавших боту (для массовых рассылок)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT DISTINCT id FROM users")
+        rows = await cur.fetchall()
+    return [r[0] for r in rows if r and r[0]]
+
+
 # ======= Заявки =======
 
 async def save_request(
@@ -145,7 +153,6 @@ async def update_status(ticket: str, status: Optional[str] = None, admin_comment
     """Меняем статус и/или комментарий админа. Если что-то None — оставляем старое."""
     now = datetime.datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        # COALESCE берёт первый NON-NULL аргумент → удобно для частичных обновлений
         await db.execute("""
             UPDATE requests
             SET status        = COALESCE(?, status),
@@ -157,7 +164,7 @@ async def update_status(ticket: str, status: Optional[str] = None, admin_comment
 
 
 async def export_requests(start_date_iso: str, end_date_iso: str) -> List[RequestRow]:
-    """Выгрузка заявок за период (ISO-строки дат). Опционально для отчётов."""
+    """Выгрузка заявок за период (ISO-строки дат)."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             SELECT id, ticket, user_id, text, media_path, latitude, longitude, status, admin_comment, created_at, updated_at
@@ -182,7 +189,7 @@ async def save_reply(ticket: str, admin_id: int, text: str):
 
 
 async def list_replies(ticket: str):
-    """История ответов по тикету (можно показывать в карточке заявки)."""
+    """История ответов по тикету."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             SELECT admin_id, text, created_at
@@ -191,3 +198,81 @@ async def list_replies(ticket: str):
             ORDER BY datetime(created_at)
         """, (ticket,))
         return await cur.fetchall()
+
+
+# ======= Сервис: очистка/массовые изменения/отчётность =======
+
+async def cleanup_active_requests() -> int:
+    """Удалить ВСЕ активные заявки (Новый/В обработке) вместе с ответами."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM requests WHERE status IN ('Новый','В обработке')")
+        count = (await cur.fetchone())[0]
+
+        await db.execute("""
+            DELETE FROM replies
+            WHERE ticket IN (SELECT ticket FROM requests WHERE status IN ('Новый','В обработке'))
+        """)
+        await db.execute("DELETE FROM requests WHERE status IN ('Новый','В обработке')")
+        await db.commit()
+        return count
+
+
+async def cleanup_all_requests() -> int:
+    """Полная очистка таблиц requests и replies."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM requests")
+        count = (await cur.fetchone())[0]
+        await db.execute("DELETE FROM replies")
+        await db.execute("DELETE FROM requests")
+        await db.commit()
+        return count
+
+
+async def cleanup_before(date_iso: str) -> int:
+    """Удалить заявки, созданные ДО указанной даты (YYYY-MM-DD)."""
+    try:
+        cutoff = datetime.datetime.strptime(date_iso, "%Y-%m-%d").isoformat()
+    except ValueError:
+        raise ValueError("date_iso must be in YYYY-MM-DD format")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT ticket FROM requests WHERE datetime(created_at) < datetime(?)", (cutoff,)
+        )
+        tickets = [row[0] for row in await cur.fetchall()]
+        if not tickets:
+            return 0
+
+        placeholders = ",".join(["?"] * len(tickets))
+        await db.execute(f"DELETE FROM replies WHERE ticket IN ({placeholders})", tickets)
+        await db.execute(f"DELETE FROM requests WHERE ticket IN ({placeholders})", tickets)
+        await db.commit()
+        return len(tickets)
+
+
+async def bulk_close_active_requests() -> int:
+    """Массово перевести активные заявки в статус 'Завершено'."""
+    now = datetime.datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE requests SET status='Завершено', updated_at=? WHERE status IN ('Новый','В обработке')",
+            (now,)
+        )
+        await db.commit()
+        if cur.rowcount is not None and cur.rowcount >= 0:
+            return cur.rowcount
+        cur2 = await db.execute("SELECT changes()")
+        changed = (await cur2.fetchone())[0]
+        return changed
+
+
+async def get_request_stats() -> Tuple[int, int, int]:
+    """Итоги: всего, завершено, отклонено."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM requests")
+        total = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM requests WHERE status='Завершено'")
+        done = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM requests WHERE status='Отклонено'")
+        declined = (await cur.fetchone())[0]
+        return total, done, declined
