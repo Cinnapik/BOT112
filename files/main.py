@@ -503,7 +503,7 @@ async def create_ticket_and_notify(
     user = update.effective_user
     ticket = gen_ticket()
 
-    # Автодетекция экстренности по ключевым словам, если категория не выбрана
+    # Автодетекция экстренности по ключевым словам (теперь без авто-роутинга)
     if not category:
         low_text = (text or '').lower()
         for kw, cat in URGENT_KEYWORDS.items():
@@ -525,45 +525,14 @@ async def create_ticket_and_notify(
 
     prefix = "🚨 " if urgency else ""
     await update.message.reply_text(
-        f"{prefix}🎟️ <b>Заявка принята!</b>\nВаш номер: <code>{esc(ticket)}</code>",
+        f"{prefix}🎟️ <b>Заявка принята!</b>\nВаш номер: <code>{esc(ticket)}</code>\n"
+        f"Оператор проверит и направит в нужный отдел.",
         reply_markup=(await ensure_user_and_admin(update))[1],
         parse_mode="HTML"
     )
 
-    # Админы (для прямых уведомлений)
+    # ТОЛЬКО уведомления администраторам (без авто-отправки в отделы)
     admins = await list_admins()
-
-    # Автоматическая маршрутизация по категории
-    targets = []
-    if category in EMERGENCY_ROUTE:
-        targets = EMERGENCY_ROUTE[category]
-    elif category in CATEGORY_TO_DEPT:
-        targets = [CATEGORY_TO_DEPT[category]]
-
-    for key in targets:
-        try:
-            await assign_department(ticket, key)
-        except Exception:
-            pass
-        dept = DEPARTMENTS.get(key) or {}
-        chat_id = dept.get("tg_chat_id")
-        name = dept.get("name", key)
-        try:
-            if chat_id:
-                if media_id and media_kind == "photo":
-                    await context.bot.send_photo(chat_id=chat_id, photo=media_id, caption=f"Заявка {ticket} ({name})\n\n{text}")
-                elif media_id and media_kind == "video":
-                    await context.bot.send_video(chat_id=chat_id, video=media_id, caption=f"Заявка {ticket} ({name})\n\n{text}")
-                elif media_id and media_kind == "document":
-                    await context.bot.send_document(chat_id=chat_id, document=media_id, caption=f"Заявка {ticket} ({name})\n\n{text}")
-                else:
-                    await context.bot.send_message(chat_id=chat_id, text=f"Заявка {ticket} ({name})\n\n{text}")
-                if lat is not None and lon is not None:
-                    await context.bot.send_location(chat_id=chat_id, latitude=lat, longitude=lon)
-        except Exception as e:
-            log.warning("Не удалось отправить в отдел %s: %s", key, e)
-
-    # Уведомим администраторов (лично)
     caption = f"Новая заявка {ticket} от @{user.username or user.id}\n\n{text}"
     buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Открыть заявку", callback_data=f"open:{ticket}")]])
     for admin_id in admins:
@@ -891,7 +860,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "<b>Как пользоваться ботом</b>\n"
             "1) «📝 Создать обращение» — текст одним сообщением (можно фото/видео с подписью и геолокацию).\n"
-            "2) После отправки бот пришлёт номер заявки. Оператор включит диалог при необходимости.\n"
+            "2) После отправки бот пришлёт номер заявки. Оператор проверит и при необходимости свяжется с вами.\n"
             "3) «📂 Мои обращения» — список ваших заявок со статусами и кнопкой «Подробнее».",
             reply_markup=kb,
             parse_mode="HTML"

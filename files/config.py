@@ -49,11 +49,11 @@ CATEGORY_TO_DEPT = {
 }
 
 EMERGENCY_ROUTE = {
-    "emerg_fire": ["fire", "police", "emergency"],
-    "emerg_murder": ["police", "emergency"],
-    "emerg_bomb": ["police", "emergency", "fire"],
-    "emerg_flood": ["emergency", "housing"],
-    "emerg_uav": ["emergency", "police", "fire"],
+    "emerg_fire":  ["fire"],             
+    "emerg_murder":["police"],            
+    "emerg_bomb":  ["police"],            
+    "emerg_flood": ["emergency"],         
+    "emerg_uav":   ["police", "emergency"]
 }
 
 URGENT_KEYWORDS = {
