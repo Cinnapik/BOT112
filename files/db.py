@@ -1,273 +1,250 @@
-# db.py
-# Здесь вся работа с базой данных (SQLite) через aiosqlite (async).
-# Таблицы:
-#  - users: кто писал боту и кто админ
-#  - requests: заявки пользователей
-#  - replies: ответы админов по заявкам
 
-import datetime
-from typing import List, Optional, Tuple
+# db.py — async слой БД (SQLite, aiosqlite)
 import aiosqlite
-
+from typing import List, Optional, Tuple
+from datetime import datetime
 from config import DB_PATH
 
-# Типы для удобства
-UserRow = Tuple[int, Optional[str], Optional[str], int]
-RequestRow = Tuple[
-    int,      # id
-    str,      # ticket
-    int,      # user_id
-    str,      # text
-    Optional[str],   # media_path
-    Optional[float], # latitude
-    Optional[float], # longitude
-    str,      # status
-    Optional[str],   # admin_comment
-    str,      # created_at
-    str       # updated_at
+# ---- SCHEMA ----
+REQUESTS_BASE_COLUMNS = [
+    "id INTEGER PRIMARY KEY AUTOINCREMENT",
+    "ticket TEXT UNIQUE",
+    "user_id INTEGER",
+    "text TEXT",
+    "media_id TEXT",
+    "latitude REAL",
+    "longitude REAL",
+    "status TEXT",
+    "admin_comment TEXT",
+    "created_at TEXT",
+    "updated_at TEXT"
+]
+REQUESTS_EXTRA_COLUMNS = [
+    "category TEXT",
+    "urgency INTEGER DEFAULT 0",
+    "department TEXT"
 ]
 
+async def _column_exists(db, table: str, column: str) -> bool:
+    cur = await db.execute(f"PRAGMA table_info({table})")
+    cols = await cur.fetchall()
+    names = [c[1] for c in cols]
+    return column in names
 
 async def init_db():
-    """Создаём таблицы, если их ещё нет. Вызывается при старте."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,         -- telegram user id
-            username TEXT,
-            first_name TEXT,
-            is_admin INTEGER DEFAULT 0      -- 0 - обычный, 1 - админ
-        )
-        """)
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticket TEXT UNIQUE,             -- читаемый номер заявки (например T202501011234...)
-            user_id INTEGER,                -- кто создал
-            text TEXT,                      -- текст заявки
-            media_path TEXT,                -- путь к файлу (если добавим медиа)
-            latitude REAL,                  -- широта (если добавим гео)
-            longitude REAL,                 -- долгота
-            status TEXT DEFAULT 'Новый',    -- статус заявки
-            admin_comment TEXT,             -- комментарий админа (если надо)
-            created_at TEXT,                -- когда создана
-            updated_at TEXT                 -- когда последний раз меняли
-        )
-        """)
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS replies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticket TEXT,                    -- к какой заявке относится ответ
-            admin_id INTEGER,               -- кто ответил (tg id админа)
-            text TEXT,                      -- текст ответа
-            created_at TEXT                 -- когда ответили
-        )
-        """)
-
+        # users
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                is_admin INTEGER DEFAULT 0
+            )
+        ''')
+        # requests
+        await db.execute(f'''
+            CREATE TABLE IF NOT EXISTS requests (
+                {", ".join(REQUESTS_BASE_COLUMNS)}
+            )
+        ''')
+        # migrate extra columns
+        for coldef in REQUESTS_EXTRA_COLUMNS:
+            colname = coldef.split()[0]
+            if not await _column_exists(db, "requests", colname):
+                await db.execute(f"ALTER TABLE requests ADD COLUMN {coldef}")
+        # replies
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS replies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket TEXT,
+                admin_id INTEGER,
+                text TEXT,
+                created_at TEXT
+            )
+        ''')
+        # audit
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket TEXT,
+                actor_id INTEGER,
+                action TEXT,
+                details TEXT,
+                created_at TEXT
+            )
+        ''')
+        # departments
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS departments (
+                key TEXT PRIMARY KEY,
+                name TEXT,
+                tg_chat_id INTEGER
+            )
+        ''')
         await db.commit()
 
-
-# ======= Пользователи =======
-
+# ---- USERS ----
 async def create_user(user_id: int, username: Optional[str], first_name: Optional[str]):
-    """Добавляем пользователя (или игнорируем, если уже есть)."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT OR IGNORE INTO users(id, username, first_name, is_admin)
-            VALUES(?, ?, ?, 0)
-        """, (user_id, username, first_name))
+        await db.execute(
+            "INSERT OR IGNORE INTO users(id, username, first_name) VALUES (?, ?, ?)",
+            (user_id, username, first_name)
+        )
+        await db.execute(
+            "UPDATE users SET username=?, first_name=? WHERE id=?",
+            (username, first_name, user_id)
+        )
         await db.commit()
-
 
 async def set_admin(user_id: int):
-    """Выдать права админа пользователю."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET is_admin=1 WHERE id=?", (user_id,))
         await db.commit()
 
-
 async def list_admins() -> List[int]:
-    """Список chat_id админов (для рассылок)."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id FROM users WHERE is_admin=1")
         rows = await cur.fetchall()
-    return [r[0] for r in rows]
-
+        return [r[0] for r in rows]
 
 async def list_all_user_ids() -> List[int]:
-    """Список всех пользователей, писавших боту (для массовых рассылок)."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT DISTINCT id FROM users")
+        cur = await db.execute("SELECT id FROM users")
         rows = await cur.fetchall()
-    return [r[0] for r in rows if r and r[0]]
+        return [r[0] for r in rows]
 
-
-# ======= Заявки =======
-
+# ---- REQUESTS ----
 async def save_request(
     ticket: str,
     user_id: int,
     text: str,
     media_path: Optional[str] = None,
     lat: Optional[float] = None,
-    lon: Optional[float] = None
+    lon: Optional[float] = None,
+    category: Optional[str] = None,
+    urgency: int = 0,
+    department: Optional[str] = None
 ):
-    """Сохраняем новую заявку в БД."""
-    now = datetime.datetime.utcnow().isoformat()
+    now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO requests(ticket, user_id, text, media_path, latitude, longitude, status, created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, 'Новый', ?, ?)
-        """, (ticket, user_id, text, media_path, lat, lon, now, now))
+        await db.execute(
+            '''
+            INSERT INTO requests (ticket, user_id, text, media_id, latitude, longitude, status, admin_comment, created_at, updated_at, category, urgency, department)
+            VALUES (?, ?, ?, ?, ?, ?, 'Новый', NULL, ?, ?, ?, ?, ?)
+            ''',
+            (ticket, user_id, text, media_path, lat, lon, now, now, category, urgency, department)
+        )
         await db.commit()
 
-
-async def list_user_requests(user_id: int) -> List[RequestRow]:
-    """Вернём заявки конкретного пользователя (сначала новые)."""
+async def list_user_requests(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT id, ticket, user_id, text, media_path, latitude, longitude, status, admin_comment, created_at, updated_at
+        cur = await db.execute(
+            '''
+            SELECT id, ticket, user_id, text, media_id, latitude, longitude, status, admin_comment, created_at, updated_at, category, urgency, department
             FROM requests
             WHERE user_id=?
             ORDER BY datetime(created_at) DESC
-        """, (user_id,))
+            ''',
+            (user_id,)
+        )
         return await cur.fetchall()
 
-
-async def get_request_by_ticket(ticket: str) -> Optional[RequestRow]:
-    """Достаём одну заявку по её тикету (если есть)."""
+async def get_request_by_ticket(ticket: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT id, ticket, user_id, text, media_path, latitude, longitude, status, admin_comment, created_at, updated_at
+        cur = await db.execute(
+            '''
+            SELECT id, ticket, user_id, text, media_id, latitude, longitude, status, admin_comment, created_at, updated_at, category, urgency, department
             FROM requests
             WHERE ticket=?
-            LIMIT 1
-        """, (ticket,))
-        row = await cur.fetchone()
-        return row
+            ''',
+            (ticket,)
+        )
+        return await cur.fetchone()
 
-
-async def update_status(ticket: str, status: Optional[str] = None, admin_comment: Optional[str] = None):
-    """Меняем статус и/или комментарий админа. Если что-то None — оставляем старое."""
-    now = datetime.datetime.utcnow().isoformat()
+async def update_status(ticket: str, status: str, admin_comment: Optional[str] = None):
+    now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            UPDATE requests
-            SET status        = COALESCE(?, status),
-                admin_comment = COALESCE(?, admin_comment),
-                updated_at    = ?
-            WHERE ticket=?
-        """, (status, admin_comment, now, ticket))
+        if admin_comment is None:
+            await db.execute("UPDATE requests SET status=?, updated_at=? WHERE ticket=?", (status, now, ticket))
+        else:
+            await db.execute("UPDATE requests SET status=?, admin_comment=?, updated_at=? WHERE ticket=?", (status, admin_comment, now, ticket))
+        await db.execute(
+            "INSERT INTO audit_log(ticket, actor_id, action, details, created_at) VALUES (?, NULL, ?, ?, ?)",
+            (ticket, "status_change", status, now)
+        )
         await db.commit()
 
-
-async def export_requests(start_date_iso: str, end_date_iso: str) -> List[RequestRow]:
-    """Выгрузка заявок за период (ISO-строки дат)."""
+async def assign_department(ticket: str, dept_key: str):
+    now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT id, ticket, user_id, text, media_path, latitude, longitude, status, admin_comment, created_at, updated_at
-            FROM requests
-            WHERE datetime(created_at) BETWEEN datetime(?) AND datetime(?)
-            ORDER BY created_at
-        """, (start_date_iso, end_date_iso))
-        return await cur.fetchall()
-
-
-# ======= Ответы админов =======
+        await db.execute("UPDATE requests SET department=?, updated_at=? WHERE ticket=?", (dept_key, now, ticket))
+        await db.execute(
+            "INSERT INTO audit_log(ticket, actor_id, action, details, created_at) VALUES (?, NULL, 'assign_department', ?, ?)",
+            (ticket, dept_key, now)
+        )
+        await db.commit()
 
 async def save_reply(ticket: str, admin_id: int, text: str):
-    """Сохраняем ответ админа по заявке."""
-    now = datetime.datetime.utcnow().isoformat()
+    now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO replies(ticket, admin_id, text, created_at)
-            VALUES(?, ?, ?, ?)
-        """, (ticket, admin_id, text, now))
+        await db.execute("INSERT INTO replies(ticket, admin_id, text, created_at) VALUES (?, ?, ?, ?)", (ticket, admin_id, text, now))
         await db.commit()
 
-
 async def list_replies(ticket: str):
-    """История ответов по тикету."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
+        cur = await db.execute(
+            '''
             SELECT admin_id, text, created_at
             FROM replies
             WHERE ticket=?
             ORDER BY datetime(created_at)
-        """, (ticket,))
+            ''',
+            (ticket,)
+        )
         return await cur.fetchall()
 
-
-# ======= Сервис: очистка/массовые изменения/отчётность =======
+async def export_requests(start_iso: str, end_iso: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            '''
+            SELECT id, ticket, user_id, text, media_id, latitude, longitude, status, admin_comment, created_at, updated_at, category, urgency, department
+            FROM requests
+            WHERE datetime(created_at) BETWEEN datetime(?) AND datetime(?)
+            ORDER BY datetime(created_at)
+            ''',
+            (start_iso, end_iso)
+        )
+        return await cur.fetchall()
 
 async def cleanup_active_requests() -> int:
-    """Удалить ВСЕ активные заявки (Новый/В обработке) вместе с ответами."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM requests WHERE status IN ('Новый','В обработке')")
-        count = (await cur.fetchone())[0]
-
-        await db.execute("""
-            DELETE FROM replies
-            WHERE ticket IN (SELECT ticket FROM requests WHERE status IN ('Новый','В обработке'))
-        """)
-        await db.execute("DELETE FROM requests WHERE status IN ('Новый','В обработке')")
+        await db.execute("DELETE FROM replies WHERE ticket IN (SELECT ticket FROM requests WHERE status IN ('Новый','В обработке'))")
+        cur = await db.execute("DELETE FROM requests WHERE status IN ('Новый','В обработке')")
         await db.commit()
-        return count
-
+        return cur.rowcount
 
 async def cleanup_all_requests() -> int:
-    """Полная очистка таблиц requests и replies."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM requests")
-        count = (await cur.fetchone())[0]
         await db.execute("DELETE FROM replies")
-        await db.execute("DELETE FROM requests")
+        cur = await db.execute("DELETE FROM requests")
         await db.commit()
-        return count
+        return cur.rowcount
 
-
-async def cleanup_before(date_iso: str) -> int:
-    """Удалить заявки, созданные ДО указанной даты (YYYY-MM-DD)."""
-    try:
-        cutoff = datetime.datetime.strptime(date_iso, "%Y-%m-%d").isoformat()
-    except ValueError:
-        raise ValueError("date_iso must be in YYYY-MM-DD format")
-
+async def cleanup_before(date_yyyy_mm_dd: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT ticket FROM requests WHERE datetime(created_at) < datetime(?)", (cutoff,)
-        )
-        tickets = [row[0] for row in await cur.fetchall()]
-        if not tickets:
-            return 0
-
-        placeholders = ",".join(["?"] * len(tickets))
-        await db.execute(f"DELETE FROM replies WHERE ticket IN ({placeholders})", tickets)
-        await db.execute(f"DELETE FROM requests WHERE ticket IN ({placeholders})", tickets)
+        await db.execute("DELETE FROM replies WHERE ticket IN (SELECT ticket FROM requests WHERE date(created_at) < date(?))", (date_yyyy_mm_dd,))
+        cur = await db.execute("DELETE FROM requests WHERE date(created_at) < date(?)", (date_yyyy_mm_dd,))
         await db.commit()
-        return len(tickets)
-
+        return cur.rowcount
 
 async def bulk_close_active_requests() -> int:
-    """Массово перевести активные заявки в статус 'Завершено'."""
-    now = datetime.datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE requests SET status='Завершено', updated_at=? WHERE status IN ('Новый','В обработке')",
-            (now,)
-        )
+        cur = await db.execute("UPDATE requests SET status='Завершено' WHERE status IN ('Новый','В обработке')")
         await db.commit()
-        if cur.rowcount is not None and cur.rowcount >= 0:
-            return cur.rowcount
-        cur2 = await db.execute("SELECT changes()")
-        changed = (await cur2.fetchone())[0]
-        return changed
+        return cur.rowcount
 
-
-async def get_request_stats() -> Tuple[int, int, int]:
-    """Итоги: всего, завершено, отклонено."""
+async def get_request_stats() -> Tuple[int,int,int]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT COUNT(*) FROM requests")
         total = (await cur.fetchone())[0]
@@ -276,3 +253,17 @@ async def get_request_stats() -> Tuple[int, int, int]:
         cur = await db.execute("SELECT COUNT(*) FROM requests WHERE status='Отклонено'")
         declined = (await cur.fetchone())[0]
         return total, done, declined
+
+async def upsert_department(key: str, name: str, tg_chat_id: Optional[int]):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO departments(key,name,tg_chat_id) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET name=excluded.name, tg_chat_id=excluded.tg_chat_id",
+            (key, name, tg_chat_id)
+        )
+        await db.commit()
+
+async def list_departments():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT key, name, tg_chat_id FROM departments ORDER BY name")
+        return await cur.fetchall()

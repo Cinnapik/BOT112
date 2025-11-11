@@ -1,17 +1,10 @@
-# main.py
-# Соответствие ТЗ:
-# - Приём обращений ТОЛЬКО в личном чате
-# - Текст + (опционально) фото/видео/документ + (опционально) геолокация
-# - После отправки: "Заявка принята, номер XXX"
-# - "Мои обращения" — статусы заявок
-# - Админ: уведомления о новых заявках, список новых/активных,
-#   смена статуса (без изменения финальных), комментарии пользователю (в ЛС),
-#   доступ по секретному коду
-# - Экспорт отчёта
-# - Опасные операции: удалить активные / закрыть активные / удалить до даты
-# - Диалог админ↔пользователь (двусторонняя переписка)
-# - Подсветка активного диалога 🟢
-# - Массовая рассылка + Отчётность в подменю «Сервис/Отчёты»
+# main.py — UI-polish edition + dialog stop button for admins
+# — Эмодзи-меню и аккуратные карточки заявок (HTML)
+# — Удобные кнопки "Подробнее" для пользователя
+# — Подтверждения опасных операций через inline-кнопки
+# — Хинты команд в меню Telegram (set_my_commands)
+# — Мягкие подсказки в мастере создания заявки
+# — Кнопка "🛑 Завершить диалог" в переписке админа с пользователем
 
 import logging
 import csv
@@ -23,7 +16,8 @@ import aiosqlite
 from telegram import (
     Update,
     ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    BotCommand
 )
 from telegram.ext import (
     ApplicationBuilder, ContextTypes,
@@ -32,14 +26,17 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest
 
-from config import BOT_TOKEN, ADMIN_SECRET, FILES_DIR, DB_PATH
+from config import (
+    BOT_TOKEN, ADMIN_SECRET, FILES_DIR, DB_PATH,
+    DEPARTMENTS, CATEGORY_TO_DEPT, EMERGENCY_ROUTE, URGENT_KEYWORDS
+)
 from utils import gen_ticket
 from db import (
     init_db, create_user, set_admin, list_admins,
     save_request, list_user_requests, get_request_by_ticket, update_status,
     save_reply, list_replies, export_requests,
     cleanup_active_requests, cleanup_all_requests, cleanup_before, bulk_close_active_requests,
-    list_all_user_ids, get_request_stats   # <-- вынес в db.py и импортирую отсюда
+    list_all_user_ids, get_request_stats, assign_department
 )
 
 # ========= ЛОГИ =========
@@ -51,38 +48,121 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram.vendor.ptb_urllib3.urllib3").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
-# ========= ГЛОБАЛЬНОЕ СОСТОЯНИЕ ДИАЛОГОВ =========
+try:
+    # Безопасная обёртка сокращения текста
+    from textwrap import shorten as _shorten
+    def s_short(s: str, width: int = 160, placeholder: str = "…") -> str:
+        s = s or ""
+        try:
+            return _shorten(s, width=width, placeholder=placeholder)
+        except Exception:
+            return (s if len(s) <= width else s[:max(0, width - len(placeholder))] + placeholder)
+except Exception:
+    def s_short(s: str, width: int = 160, placeholder: str = "…") -> str:
+        s = s or ""
+        return (s if len(s) <= width else s[:max(0, width - len(placeholder))] + placeholder)
+
+
+# ========= ГЛОБАЛЬНЫЕ ДИАЛОГИ =========
 ACTIVE_DIALOGS_BY_TICKET = {}   # ticket -> {'admin_id': int, 'user_id': int}
 ACTIVE_DIALOGS_BY_ADMIN = {}    # admin_id -> ticket
 ACTIVE_DIALOGS_BY_USER = {}     # user_id -> ticket
 
-# ========= КНОПКИ =========
-BTN_CREATE = "Создать обращение"
-BTN_MY = "Мои обращения"
-BTN_HELP = "Справка"
-BTN_ADMIN = "Админ-меню"
+# ========= КНОПКИ (обновлённые, с эмодзи) =========
+BTN_CREATE = "📝 Создать обращение"
+BTN_MY = "📂 Мои обращения"
+BTN_HELP = "ℹ️ Справка"
+BTN_ADMIN = "🛠️ Админ-меню"
+BTN_CANCEL = "❌ Отмена"
+BTN_CHOOSE_CATEGORY = "🏷️ Выбрать категорию"
 
 # внутри админ-меню
-BTN_ADMIN_NEW = "Последние заявки (5)"
-BTN_ADMIN_ACTIVE = "Активные заявки"
-BTN_ADMIN_FIND = "Открыть по тикету"
-BTN_ADMIN_SERVICE = "Сервис/Отчёты"
-BTN_BACK = "Назад"
+BTN_ADMIN_NEW = "🆕 Последние заявки (5)"
+BTN_ADMIN_ACTIVE = "🔥 Активные заявки"
+BTN_ADMIN_FIND = "🔎 Открыть по тикету"
+BTN_ADMIN_SERVICE = "📊 Сервис и отчёты"
+BTN_BACK = "⬅️ В главное меню"
 
 # подменю «Сервис/Отчёты»
-BTN_EXPORT = "Экспорт отчёта"
-BTN_BROADCAST = "Массовая рассылка"
-BTN_STATS = "Отчётность"
-BTN_ADMIN_DANGER = "Удаление заявок (ОПАСНО)"
-BTN_SERVICE_BACK = "⬅️ В админ-меню"
+BTN_EXPORT = "📤 Экспорт отчёта"
+BTN_BROADCAST = "📣 Массовая рассылка"
+BTN_STATS = "📈 Отчётность"
+BTN_ADMIN_DANGER = "⚠️ Опасные операции"
+BTN_SERVICE_BACK = "⬅️ Назад в админ-меню"
 
 # подменю «ОПАСНО»
-BTN_CLEAN_ACTIVE = "Удалить активные"
-BTN_BULKCLOSE_ACTIVE = "Закрыть активные"
-BTN_CLEAN_BEFORE = "Удалить до даты…"
-BTN_DANGER_BACK = "⬅️ Назад в «Сервис/Отчёты»"
+BTN_CLEAN_ACTIVE = "🗑️ Удалить активные…"
+BTN_BULKCLOSE_ACTIVE = "✅ Закрыть активные…"
+BTN_CLEAN_BEFORE = "🗓️ Удалить до даты…"
+BTN_DANGER_BACK = "⬅️ Назад"
 
-# ----- Клавиатуры -----
+# ========= УТИЛИТЫ ФОРМАТИРОВАНИЯ =========
+def normalize(text: Optional[str]) -> str:
+    return (text or "").strip().lower()
+
+def esc(s: object) -> str:
+    """Простейший HTML-эскейп (достаточно для телеграма)."""
+    t = str(s if s is not None else "")
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def status_badge(status: str) -> str:
+    m = {
+        "Новый": "🆕 Новый",
+        "В обработке": "🛠️ В обработке",
+        "Завершено": "✅ Завершено",
+        "Отклонено": "⛔ Отклонено",
+    }
+    return m.get(status, esc(status))
+
+def ticket_card_for_admin(row, dialog_info=None, last_reply=None) -> str:
+    # row из SELECT ... requests: 14 полей
+    _id, ticket, user_id, text, media, lat, lon, status, admin_comment, created, updated, category, urgency, department = row
+    lines = []
+    lines.append(f"<b>Заявка {esc(ticket)}</b>")
+    lines.append(f"Автор: <code>{user_id}</code>")
+    lines.append(f"Создана: <code>{esc(created)}</code>")
+    lines.append(f"Статус: <b>{status_badge(status)}</b>")
+    if category:
+        lines.append(f"Категория: <code>{esc(category)}</code>")
+    if department:
+        lines.append(f"Направлена в отдел: <code>{esc(department)}</code>")
+    if urgency:
+        lines.append("⚠️ Отмечена как <b>экстренная</b>")
+    if dialog_info:
+        lines.append(f"Диалог: 🟢 активен (оператор <code>{dialog_info.get('admin_id')}</code>)")
+    if lat is not None and lon is not None:
+        lines.append(f"Координаты: <code>{lat:.6f}, {lon:.6f}</code>")
+    if admin_comment:
+        lines.append(f"Комментарий оператора: {esc(admin_comment)}")
+    if last_reply:
+        lines.append(f"\n<b>Последний ответ:</b> {esc(last_reply[1])}\n<code>{esc(last_reply[2])}</code>")
+    lines.append("\n<b>Текст обращения:</b>")
+    lines.append(esc(text))
+    return "\n".join(lines)
+
+def ticket_card_for_user(row, last_reply=None) -> str:
+    _id, ticket, user_id, text, media, lat, lon, status, admin_comment, created, updated, category, urgency, department = row
+    lines = []
+    lines.append(f"<b>Заявка {esc(ticket)}</b>")
+    lines.append(f"Создана: <code>{esc(created)}</code>")
+    lines.append(f"Статус: <b>{status_badge(status)}</b>")
+    if category:
+        lines.append(f"Категория: <code>{esc(category)}</code>")
+    if department:
+        lines.append(f"Направлена в отдел: <code>{esc(department)}</code>")
+    if urgency:
+        lines.append("⚠️ Отмечена как <b>экстренная</b>")
+    if lat is not None and lon is not None:
+        lines.append(f"Координаты: <code>{lat:.6f}, {lon:.6f}</code>")
+    if admin_comment:
+        lines.append(f"Комментарий оператора: {esc(admin_comment)}")
+    if last_reply:
+        lines.append(f"\n<b>Последний ответ:</b> {esc(last_reply[1])}\n<code>{esc(last_reply[2])}</code>")
+    lines.append("\n<b>Текст обращения:</b>")
+    lines.append(esc(text))
+    return "\n".join(lines)
+
+# ========= КЛАВИАТУРЫ =========
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton(BTN_CREATE)],
      [KeyboardButton(BTN_MY)],
@@ -138,10 +218,42 @@ def danger_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
-# ======= ВСПОМОГАТЕЛЬНОЕ =======
-def normalize(text: Optional[str]) -> str:
-    return (text or "").strip().lower()
+def admin_dialog_inline_keyboard(ticket: str) -> InlineKeyboardMarkup:
+    """Инлайн-кнопки для админа прямо в чате во время активного диалога."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛑 Завершить диалог", callback_data=f"dialog:stop:{ticket}")],
+        [InlineKeyboardButton("📄 Открыть карточку", callback_data=f"open:{ticket}")]
+    ])
 
+def build_category_keyboard():
+    rows = [
+        [InlineKeyboardButton("🚨 Пожар", callback_data="cat:emerg_fire"),
+         InlineKeyboardButton("🚨 Убийство/Нападение", callback_data="cat:emerg_murder")],
+        [InlineKeyboardButton("🚨 Бомба/Заминировано", callback_data="cat:emerg_bomb"),
+         InlineKeyboardButton("🚨 Наводнение/Потоп", callback_data="cat:emerg_flood")],
+        [InlineKeyboardButton("🚨 Атака БПЛА", callback_data="cat:emerg_uav")],
+        [InlineKeyboardButton("👮 Полиция", callback_data="cat:police"),
+         InlineKeyboardButton("🔥 Пожарная часть", callback_data="cat:fire")],
+        [InlineKeyboardButton("🏠 ЖКХ", callback_data="cat:housing"),
+         InlineKeyboardButton("🛣️ Дороги", callback_data="cat:roads")],
+        [InlineKeyboardButton("💡 Освещение", callback_data="cat:lighting"),
+         InlineKeyboardButton("🚰 Водоканал", callback_data="cat:water")],
+        [InlineKeyboardButton("🔥 Теплосети", callback_data="cat:heat"),
+         InlineKeyboardButton("🧯 Газ", callback_data="cat:gas")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def build_create_flow_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📍 Прикрепить геолокацию", request_location=True)],
+            [KeyboardButton(BTN_CANCEL)]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+
+# ========= МАЛЫЕ SQL-ХЭЛПЕРЫ ДЛЯ АДМИНА =========
 async def admin_recent_requests(limit: int = 5) -> List[Tuple]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -169,19 +281,10 @@ async def admin_active_requests(limit: int = 20) -> List[Tuple]:
         )
         return await cur.fetchall()
 
+# ========= СЛУЖЕБНОЕ =========
 def private_only(update: Update) -> bool:
     chat = update.effective_chat
     return bool(chat and chat.type == "private")
-
-def build_create_flow_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("Прикрепить геолокацию", request_location=True)],
-            [KeyboardButton("Отмена")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False
-    )
 
 async def ensure_user_and_admin(update: Update) -> tuple[bool, ReplyKeyboardMarkup]:
     user = update.effective_user
@@ -190,7 +293,7 @@ async def ensure_user_and_admin(update: Update) -> tuple[bool, ReplyKeyboardMark
     is_admin = user.id in admins
     return is_admin, make_keyboard(is_admin)
 
-# ======= КОМАНДЫ =======
+# ========= КОМАНДЫ =========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not private_only(update):
         await update.message.reply_text("Пожалуйста, напишите мне в личном чате.")
@@ -200,11 +303,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admins = await list_admins()
     is_admin = user.id in admins
     await update.message.reply_text(
-        "Привет! Это бот 112 для обращений по ЖКХ/благоустройству.\n\n"
-        "Нажми «Создать обращение», чтобы оставить заявку.\n"
-        "«Мои обращения» — список твоих заявок.\n"
-        "«Справка» — краткая помощь.",
-        reply_markup=make_keyboard(is_admin)
+        "<b>Привет!</b> Я бот для обращений по ЖКХ/благоустройству.\n\n"
+        "Нажмите «📝 Создать обращение», чтобы оставить заявку.\n"
+        "«📂 Мои обращения» — ваши статусы и история.\n"
+        "«ℹ️ Справка» — короткая инструкция.",
+        reply_markup=make_keyboard(is_admin),
+        parse_mode="HTML"
     )
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -214,12 +318,12 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = update.message.text.split(maxsplit=1)
     if len(args) < 2:
-        await update.message.reply_text("Использование: /admin <секретный_код>", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text("Использование: <code>/admin &lt;секретный_код&gt;</code>", reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
         return
     code = args[1].strip()
     if code == ADMIN_SECRET:
         await set_admin(user.id)
-        await update.message.reply_text("Готово! Вы администратор.", reply_markup=make_keyboard(True))
+        await update.message.reply_text("Готово! У вас права администратора.", reply_markup=make_keyboard(True))
     else:
         await update.message.reply_text("Код неверный.", reply_markup=MAIN_KEYBOARD)
 
@@ -237,8 +341,9 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = (update.message.text or "").split()
     if len(parts) != 4 or parts[1] not in ("csv", "txt"):
         await update.message.reply_text(
-            "Использование:\n/export csv 2025-11-01 2025-11-10\nили\n/export txt 2025-11-01 2025-11-10",
-            reply_markup=service_keyboard()
+            "Использование:\n<code>/export csv 2025-11-01 2025-11-10</code>\nили\n<code>/export txt 2025-11-01 2025-11-10</code>",
+            reply_markup=service_keyboard(),
+            parse_mode="HTML"
         )
         return
 
@@ -258,7 +363,7 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
     if fmt == "csv":
         filename = Path(FILES_DIR) / f"report_{d1}_{d2}_{ts}.csv"
-        headers = ["id","ticket","user_id","text","media_id","latitude","longitude","status","admin_comment","created_at","updated_at"]
+        headers = ["id","ticket","user_id","text","media_id","latitude","longitude","status","admin_comment","created_at","updated_at","category","urgency","department"]
         with open(filename, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f, delimiter=";")
             writer.writerow(headers)
@@ -279,9 +384,15 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f.write(f"  - {st}: {cnt}\n")
             f.write("\nСписок обращений:\n")
             for r in rows:
-                _id,ticket,uid,text,media,lat,lon,status,comment,created,updated = r
+                _id,ticket,uid,text,media,lat,lon,status,comment,created,updated,category,urgency,department = r
                 f.write(f"\n[{ticket}] {created} — {status}\n")
                 f.write(f"Автор: {uid}\n")
+                if category:
+                    f.write(f"Категория: {category}\n")
+                if department:
+                    f.write(f"Отдел: {department}\n")
+                if urgency:
+                    f.write(f"Экстренность: да\n")
                 if lat is not None and lon is not None:
                     f.write(f"Координаты: {lat:.6f}, {lon:.6f}\n")
                 if media:
@@ -361,9 +472,10 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").split(maxsplit=1)
     if len(text) < 2 or not text[1].strip():
         await update.message.reply_text(
-            "Использование: /broadcast <текст сообщения>\n"
-            "Либо нажмите «Массовая рассылка» в подменю «Сервис/Отчёты».",
-            reply_markup=service_keyboard()
+            "Использование: <code>/broadcast &lt;текст сообщения&gt;</code>\n"
+            "Либо нажмите «📣 Массовая рассылка» в «📊 Сервис и отчёты».",
+            reply_markup=service_keyboard(),
+            parse_mode="HTML"
         )
         return
 
@@ -374,9 +486,9 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✅ Отправить всем", callback_data="broadcast:confirm")],
         [InlineKeyboardButton("✖ Отмена", callback_data="broadcast:cancel")]
     ])
-    await update.message.reply_text(f"Предпросмотр рассылки:\n\n{payload}", reply_markup=kb)
+    await update.message.reply_text(f"Предпросмотр рассылки:\n\n{esc(payload)}", reply_markup=kb, parse_mode="HTML")
 
-# ======= СОЗДАНИЕ ЗАЯВКИ =======
+# ========= СОЗДАНИЕ ЗАЯВКИ =========
 async def create_ticket_and_notify(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -384,24 +496,76 @@ async def create_ticket_and_notify(
     media_id: Optional[str] = None,
     media_kind: Optional[str] = None,
     lat: Optional[float] = None,
-    lon: Optional[float] = None
+    lon: Optional[float] = None,
+    category: Optional[str] = None,
+    urgency: int = 0
 ):
     user = update.effective_user
     ticket = gen_ticket()
-    await save_request(ticket=ticket, user_id=user.id, text=text, media_path=media_id, lat=lat, lon=lon)
 
-    await update.message.reply_text(
-        f"Заявка принята! Номер: {ticket}",
-        reply_markup=(await ensure_user_and_admin(update))[1]
+    # Автодетекция экстренности по ключевым словам, если категория не выбрана
+    if not category:
+        low_text = (text or '').lower()
+        for kw, cat in URGENT_KEYWORDS.items():
+            if kw in low_text:
+                category = cat
+                urgency = 1
+                break
+
+    await save_request(
+        ticket=ticket,
+        user_id=user.id,
+        text=text,
+        media_path=media_id,
+        lat=lat,
+        lon=lon,
+        category=category,
+        urgency=urgency
     )
 
-    admins = await list_admins()
-    if not admins:
-        return
+    prefix = "🚨 " if urgency else ""
+    await update.message.reply_text(
+        f"{prefix}🎟️ <b>Заявка принята!</b>\nВаш номер: <code>{esc(ticket)}</code>",
+        reply_markup=(await ensure_user_and_admin(update))[1],
+        parse_mode="HTML"
+    )
 
+    # Админы (для прямых уведомлений)
+    admins = await list_admins()
+
+    # Автоматическая маршрутизация по категории
+    targets = []
+    if category in EMERGENCY_ROUTE:
+        targets = EMERGENCY_ROUTE[category]
+    elif category in CATEGORY_TO_DEPT:
+        targets = [CATEGORY_TO_DEPT[category]]
+
+    for key in targets:
+        try:
+            await assign_department(ticket, key)
+        except Exception:
+            pass
+        dept = DEPARTMENTS.get(key) or {}
+        chat_id = dept.get("tg_chat_id")
+        name = dept.get("name", key)
+        try:
+            if chat_id:
+                if media_id and media_kind == "photo":
+                    await context.bot.send_photo(chat_id=chat_id, photo=media_id, caption=f"Заявка {ticket} ({name})\n\n{text}")
+                elif media_id and media_kind == "video":
+                    await context.bot.send_video(chat_id=chat_id, video=media_id, caption=f"Заявка {ticket} ({name})\n\n{text}")
+                elif media_id and media_kind == "document":
+                    await context.bot.send_document(chat_id=chat_id, document=media_id, caption=f"Заявка {ticket} ({name})\n\n{text}")
+                else:
+                    await context.bot.send_message(chat_id=chat_id, text=f"Заявка {ticket} ({name})\n\n{text}")
+                if lat is not None and lon is not None:
+                    await context.bot.send_location(chat_id=chat_id, latitude=lat, longitude=lon)
+        except Exception as e:
+            log.warning("Не удалось отправить в отдел %s: %s", key, e)
+
+    # Уведомим администраторов (лично), если назначенных нет/мало — они увидят и откроют
     caption = f"Новая заявка {ticket} от @{user.username or user.id}\n\n{text}"
     buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Открыть заявку", callback_data=f"open:{ticket}")]])
-
     for admin_id in admins:
         try:
             if media_id and media_kind == "photo":
@@ -417,7 +581,7 @@ async def create_ticket_and_notify(
         except Exception as e:
             log.warning("Не удалось уведомить админа %s: %s", admin_id, e)
 
-# ======= ОСНОВНАЯ ЛОГИКА СООБЩЕНИЙ =======
+# ========= ОСНОВНОЙ ХЭНДЛЕР СООБЩЕНИЙ =========
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -448,26 +612,38 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         cap = update.message.caption or ""
                         await context.bot.send_photo(chat_id=author_id, photo=fid,
                                                      caption=f"От оператора (заявка {t}):\n{cap}")
-                        if cap: await save_reply(t, admin_id, cap)
+                        if cap:
+                            await save_reply(t, admin_id, cap)
                     elif update.message.video:
                         fid = update.message.video.file_id
                         cap = update.message.caption or ""
                         await context.bot.send_video(chat_id=author_id, video=fid,
                                                      caption=f"От оператора (заявка {t}):\n{cap}")
-                        if cap: await save_reply(t, admin_id, cap)
+                        if cap:
+                            await save_reply(t, admin_id, cap)
                     elif update.message.document:
                         fid = update.message.document.file_id
                         cap = update.message.caption or ""
                         await context.bot.send_document(chat_id=author_id, document=fid,
                                                         caption=f"От оператора (заявка {t}):\n{cap}")
-                        if cap: await save_reply(t, admin_id, cap)
+                        if cap:
+                            await save_reply(t, admin_id, cap)
                     else:
-                        await update.message.reply_text("Тип сообщения не поддержан в диалоге.", reply_markup=kb)
+                        await update.message.reply_text(
+                            "Тип сообщения не поддержан в диалоге.",
+                            reply_markup=admin_dialog_inline_keyboard(ticket)
+                        )
                         return
-                    await update.message.reply_text("Сообщение отправлено пользователю.", reply_markup=kb)
+                    await update.message.reply_text(
+                        "Сообщение отправлено пользователю.",
+                        reply_markup=admin_dialog_inline_keyboard(ticket)
+                    )
                 except Exception as e:
                     log.warning("Не удалось отправить автору: %s", e)
-                    await update.message.reply_text("Не удалось отправить сообщение пользователю.", reply_markup=kb)
+                    await update.message.reply_text(
+                        "Не удалось отправить сообщение пользователю.",
+                        reply_markup=admin_dialog_inline_keyboard(ticket)
+                    )
                 return
 
     # ===== Сообщения ПОЛЬЗОВАТЕЛЯ при активном диалоге =====
@@ -524,28 +700,12 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Заявка {ticket} не найдена.", reply_markup=admin_keyboard() if is_admin else kb)
             return
 
-        _id, ticket, user_id_author, rtext, media_path, lat, lon, status, admin_comment, created, updated = row
         replies = await list_replies(ticket)
-        replies_block = ""
-        if replies:
-            last = replies[-1]
-            rtext_last, rtime = last[1], last[2]
-            replies_block = f"\n\nПоследний ответ: {rtext_last}\n({rtime})"
-
+        last = replies[-1] if replies else None
         dialog_info = ACTIVE_DIALOGS_BY_TICKET.get(ticket)
-        dialog_line = ""
-        if dialog_info:
-            dialog_line = f"\nДиалог: 🟢 активен (оператор {dialog_info['admin_id']})"
-
-        msg = (
-            f"Заявка {ticket}\n"
-            f"Автор: {user_id_author}\n"
-            f"Создана: {created}\n"
-            f"Статус: {status}{dialog_line}\n"
-            f"Текст:\n{rtext}{replies_block}"
-        )
-
-        if status in ("Завершено", "Отклонено"):
+        msg = ticket_card_for_admin(row, dialog_info=dialog_info, last_reply=last)
+        # Кнопки управления
+        if row[7] in ("Завершено", "Отклонено"):
             buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Ответить пользователю", callback_data=f"reply:{ticket}")]])
         else:
             if dialog_info and dialog_info.get("admin_id") == update.effective_user.id:
@@ -557,11 +717,11 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buttons = InlineKeyboardMarkup([
                 dialog_row,
                 [InlineKeyboardButton("Ответить (разово)", callback_data=f"reply:{ticket}")],
+                [InlineKeyboardButton("Направить в отдел", callback_data=f"route_menu:{ticket}")],
                 [InlineKeyboardButton("Завершено", callback_data=f"status:{ticket}:Завершено"),
                  InlineKeyboardButton("Отклонено", callback_data=f"status:{ticket}:Отклонено")]
             ])
-
-        await update.message.reply_text(msg, reply_markup=buttons)
+        await update.message.reply_text(msg, reply_markup=buttons, parse_mode="HTML")
         return
 
     # режим разового ответа оператором (без диалога)
@@ -608,7 +768,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await export_command(update, context)
         return
 
-    # ожидание текста для рассылки (кнопка «Массовая рассылка»)
+    # ожидание текста для рассылки
     if is_admin and context.user_data.get("expect_broadcast_text"):
         context.user_data.pop("expect_broadcast_text", None)
         payload = text.strip()
@@ -620,7 +780,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ Отправить всем", callback_data="broadcast:confirm")],
             [InlineKeyboardButton("✖ Отмена", callback_data="broadcast:cancel")]
         ])
-        await update.message.reply_text(f"Предпросмотр рассылки:\n\n{payload}", reply_markup=kb_inline)
+        await update.message.reply_text(f"Предпросмотр рассылки:\n\n{esc(payload)}", reply_markup=kb_inline, parse_mode="HTML")
         return
 
     # ====== ПРОЦЕСС СОЗДАНИЯ ЗАЯВКИ ======
@@ -628,8 +788,13 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.location:
             context.user_data["pending_lat"] = update.message.location.latitude
             context.user_data["pending_lon"] = update.message.location.longitude
-            await update.message.reply_text("Геолокация добавлена ✅. Теперь отправьте текст проблемы (и при желании фото/видео с подписью).",
-                                            reply_markup=build_create_flow_keyboard())
+            await update.message.reply_text(
+                "📍 Геолокация добавлена.\n"
+                "Теперь отправьте <b>текст проблемы</b> одним сообщением. "
+                "Можно приложить фото/видео с подписью.",
+                reply_markup=build_create_flow_keyboard(),
+                parse_mode="HTML"
+            )
             return
 
         media_id = None
@@ -653,10 +818,10 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if media_id and not text:
             context.user_data["pending_media_id"] = media_id
             context.user_data["pending_media_kind"] = media_kind
-            await update.message.reply_text("Медиа получено ✅. Теперь, пожалуйста, опишите проблему текстом.")
+            await update.message.reply_text("📎 Медиа получено. Теперь, пожалуйста, опишите проблему <b>текстом</b>.", parse_mode="HTML")
             return
 
-        if low == "отмена":
+        if low in ("отмена", normalize(BTN_CANCEL)):
             context.user_data.pop("awaiting_request", None)
             context.user_data.pop("pending_media_id", None)
             context.user_data.pop("pending_media_kind", None)
@@ -672,27 +837,34 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             media_kind = media_kind or context.user_data.pop("pending_media_kind", None)
             context.user_data.pop("awaiting_request", None)
 
+            cat = context.user_data.pop("pending_category", None)
+            urgent = 1 if context.user_data.pop("pending_urgent", 0) else 0
             await create_ticket_and_notify(
                 update, context, text=text,
                 media_id=media_id, media_kind=media_kind,
-                lat=lat, lon=lon
+                lat=lat, lon=lon,
+                category=cat, urgency=urgent
             )
             return
 
         await update.message.reply_text(
-            "Опишите проблему текстом одним сообщением. Можно приложить фото/видео с подписью и/или отправить геолокацию.",
-            reply_markup=build_create_flow_keyboard()
+            "Опишите проблему <b>текстом одним сообщением</b>. "
+            "Можно приложить фото/видео с подписью и/или отправить геолокацию.",
+            reply_markup=build_create_flow_keyboard(),
+            parse_mode="HTML"
         )
         return
 
     # ====== ОБРАБОТКА КНОПОК ГЛАВНОГО МЕНЮ ======
     if low == normalize(BTN_CREATE):
         context.user_data["awaiting_request"] = True
+        context.user_data.pop("pending_category", None)
+        context.user_data.pop("pending_urgent", None)
+        kb_inline = build_category_keyboard()
         await update.message.reply_text(
-            "Напишите текст вашей заявки одним сообщением.\n"
-            "Можно приложить фото/видео как *подпись к медиа* и/или отправить геолокацию кнопкой ниже.",
-            reply_markup=build_create_flow_keyboard(),
-            parse_mode="Markdown"
+            "<b>Шаг 1 из 3.</b>\nВыберите <b>категорию</b> проблемы (можно экстренную):",
+            reply_markup=kb_inline,
+            parse_mode="HTML"
         )
         return
 
@@ -701,22 +873,28 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await update.message.reply_text("У вас пока нет заявок.", reply_markup=kb)
             return
-        lines = []
+        # Покажем аккуратный список + кнопки «Подробнее»
         for r in rows[:10]:
-            _id, ticket, _uid, rtext, _mp, _lat, _lon, status, _cmt, created, _upd = r
-            snippet = (rtext[:60] + "…") if len(rtext) > 60 else rtext
-            lines.append(f"{ticket} — {status} — {created}\n{snippet}")
-        await update.message.reply_text("Ваши последние заявки:\n\n" + "\n\n".join(lines), reply_markup=kb)
+            _id, ticket, _uid, rtext, _mp, _lat, _lon, status, _cmt, created, _upd, _cat, _urg, _dept = r
+            snippet = s_short(rtext, width=160, placeholder="…")
+            msg = (
+                f"<b>{esc(ticket)}</b> — {status_badge(status)}\n"
+                f"<i>{esc(created)}</i>\n"
+                f"{esc(snippet)}"
+            )
+            buttons = InlineKeyboardMarkup([[InlineKeyboardButton("📄 Подробнее", callback_data=f"openuser:{ticket}")]])
+            await update.message.reply_text(msg, reply_markup=buttons, parse_mode="HTML")
+        await update.message.reply_text("Показаны последние заявки.", reply_markup=kb)
         return
 
     if low == normalize(BTN_HELP):
         await update.message.reply_text(
-            "Как пользоваться ботом:\n"
-            "1) «Создать обращение» — текст одним сообщением (можно фото/видео с подписью и геолокацию).\n"
-            "2) После отправки бот пришлёт номер заявки. Админ уточняет детали в диалоге при необходимости.\n"
-            "3) «Мои обращения» — список ваших заявок со статусами.\n"
-            "4) Админ: «Админ-меню» → «Сервис/Отчёты».",
-            reply_markup=kb
+            "<b>Как пользоваться ботом</b>\n"
+            "1) «📝 Создать обращение» — текст одним сообщением (можно фото/видео с подписью и геолокацию).\n"
+            "2) После отправки бот пришлёт номер заявки. Оператор включит диалог при необходимости.\n"
+            "3) «📂 Мои обращения» — список ваших заявок со статусами и кнопкой «Подробнее».",
+            reply_markup=kb,
+            parse_mode="HTML"
         )
         return
 
@@ -731,11 +909,11 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Заявок пока нет.", reply_markup=admin_keyboard())
             return
         for ticket, uid, rtext, status, created in rows:
-            snippet = (rtext[:160] + "…") if len(rtext) > 160 else rtext
+            snippet = s_short(rtext, width=220, placeholder="…")
             dial = " 🟢 Диалог" if ticket in ACTIVE_DIALOGS_BY_TICKET else ""
-            msg = f"Заявка {ticket}\nСТАТУС: {status}{dial}\nАвтор: {uid}\nСоздана: {created}\n\n{snippet}"
+            msg = f"<b>Заявка {esc(ticket)}</b>\nСТАТУС: {status_badge(status)}{dial}\nАвтор: <code>{uid}</code>\nСоздана: <code>{esc(created)}</code>\n\n{esc(snippet)}"
             buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Открыть", callback_data=f"open:{ticket}")]])
-            await update.message.reply_text(msg, reply_markup=buttons)
+            await update.message.reply_text(msg, reply_markup=buttons, parse_mode="HTML")
         await update.message.reply_text("Готово.", reply_markup=admin_keyboard())
         return
 
@@ -745,17 +923,17 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Активных заявок нет.", reply_markup=admin_keyboard())
             return
         for ticket, uid, rtext, status, created in rows:
-            snippet = (rtext[:160] + "…") if len(rtext) > 160 else rtext
+            snippet = s_short(rtext, width=220, placeholder="…")
             dial = " 🟢 Диалог" if ticket in ACTIVE_DIALOGS_BY_TICKET else ""
-            msg = f"Заявка {ticket}\nСТАТУС: {status}{dial}\nАвтор: {uid}\nСоздана: {created}\n\n{snippet}"
+            msg = f"<b>Заявка {esc(ticket)}</b>\nСТАТУС: {status_badge(status)}{dial}\nАвтор: <code>{uid}</code>\nСоздана: <code>{esc(created)}</code>\n\n{esc(snippet)}"
             buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Открыть", callback_data=f"open:{ticket}")]])
-            await update.message.reply_text(msg, reply_markup=buttons)
+            await update.message.reply_text(msg, reply_markup=buttons, parse_mode="HTML")
         await update.message.reply_text("Готово.", reply_markup=admin_keyboard())
         return
 
     if is_admin and low == normalize(BTN_ADMIN_FIND):
         context.user_data["expect_ticket_to_open"] = True
-        await update.message.reply_text("Введите номер тикета (например: T20251110152312001):", reply_markup=admin_keyboard())
+        await update.message.reply_text("Введите номер тикета (например: <code>T20251110152312001</code>):", reply_markup=admin_keyboard(), parse_mode="HTML")
         return
 
     # --- Подменю «Сервис/Отчёты» ---
@@ -770,9 +948,9 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin and low == normalize(BTN_EXPORT):
         context.user_data["expect_export_params"] = True
         await update.message.reply_text(
-            "Экспорт отчёта.\nОтправьте: csv|txt YYYY-MM-DD YYYY-MM-DD\nНапример: `csv 2025-11-01 2025-11-10`",
+            "Экспорт отчёта.\nОтправьте: <code>csv|txt YYYY-MM-DD YYYY-MM-DD</code>\nНапример: <code>csv 2025-11-01 2025-11-10</code>",
             reply_markup=service_keyboard(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
 
@@ -801,25 +979,32 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Подменю «ОПАСНО» ---
     if is_admin and low == normalize(BTN_CLEAN_ACTIVE):
-        n = await cleanup_active_requests()
-        await update.message.reply_text(f"Удалено активных заявок: {n}", reply_markup=service_keyboard())
+        kb_inline = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, удалить активные", callback_data="danger:clean_active:confirm")],
+            [InlineKeyboardButton("✖ Отмена", callback_data="danger:cancel")]
+        ])
+        await update.message.reply_text("Удалить <b>все активные</b> заявки (Новый/В обработке)?", reply_markup=kb_inline, parse_mode="HTML")
         return
 
     if is_admin and low == normalize(BTN_BULKCLOSE_ACTIVE):
-        n = await bulk_close_active_requests()
-        await update.message.reply_text(f"Закрыто активных заявок: {n}", reply_markup=service_keyboard())
+        kb_inline = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, закрыть активные", callback_data="danger:bulkclose_active:confirm")],
+            [InlineKeyboardButton("✖ Отмена", callback_data="danger:cancel")]
+        ])
+        await update.message.reply_text("Перевести <b>все активные</b> заявки в статус «Завершено»?", reply_markup=kb_inline, parse_mode="HTML")
         return
 
     if is_admin and low == normalize(BTN_CLEAN_BEFORE):
         context.user_data["expect_cleanup_date"] = True
         await update.message.reply_text(
-            "Введите дату в формате YYYY-MM-DD (всё, что СТРОГО раньше этой даты, будет удалено):",
-            reply_markup=danger_keyboard()
+            "Введите дату в формате YYYY-MM-DD (всё, что <b>строго раньше</b> этой даты, будет удалено):",
+            reply_markup=danger_keyboard(),
+            parse_mode="HTML"
         )
         return
 
     if is_admin and low == normalize(BTN_DANGER_BACK):
-        await update.message.reply_text("Возврат в «Сервис/Отчёты».", reply_markup=service_keyboard())
+        await update.message.reply_text("Возврат в «Сервис и отчёты».", reply_markup=service_keyboard())
         return
 
     if is_admin and low == normalize(BTN_BACK):
@@ -827,12 +1012,12 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "Нажмите «Создать обращение», чтобы оставить заявку.\n"
-        "Или «Мои обращения», чтобы посмотреть статусы.",
+        "Нажмите «📝 Создать обращение» чтобы оставить заявку, "
+        "или «📂 Мои обращения» чтобы посмотреть статусы.",
         reply_markup=kb
     )
 
-# ======= CALLBACK-КНОПКИ ДЛЯ АДМИНОВ =======
+# ========= CALLBACK-КНОПКИ =========
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
@@ -842,13 +1027,97 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except BadRequest:
         pass
 
+    data = (query.data or "").strip()
     user = update.effective_user
+
+    # --- Пользователь: открыть свою карточку заявки ---
+    if data.startswith("openuser:"):
+        ticket = data.split(":", 1)[1]
+        row = await get_request_by_ticket(ticket)
+        if not row:
+            await context.bot.send_message(chat_id=query.message.chat_id, text="Заявка не найдена.")
+            return
+        # Проверим, что это его заявка
+        if row[2] != user.id:
+            await context.bot.send_message(chat_id=query.message.chat_id, text="Это не ваша заявка.")
+            return
+        replies = await list_replies(ticket)
+        last = replies[-1] if replies else None
+        msg = ticket_card_for_user(row, last_reply=last)
+        try:
+            await query.edit_message_text(msg, parse_mode="HTML")
+        except BadRequest:
+            await context.bot.send_message(chat_id=query.message.chat_id, text=msg, parse_mode="HTML")
+        return
+
+    # --- Выбор категории пользователем ---
+    if data.startswith("cat:"):
+        key = data.split(":", 1)[1]
+        context.user_data["pending_category"] = key
+        context.user_data["pending_urgent"] = 1 if key.startswith("emerg_") else 0
+        try:
+            await query.edit_message_text(
+                f"Категория установлена: <b>{key}</b>\nТеперь отправьте текст проблемы одним сообщением. Можно прикрепить фото/видео и геолокацию.",
+                parse_mode="HTML"
+            )
+        except BadRequest:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"Категория установлена: {key}. Теперь отправьте текст проблемы одним сообщением."
+            )
+        return
+
+    # --- Меню направить в отдел (админ) ---
+    if data.startswith("route_menu:"):
+        ticket = data.split(":", 1)[1]
+        rows = []
+        pair = []
+        for key, d in DEPARTMENTS.items():
+            name = d.get("name", key)
+            pair.append(InlineKeyboardButton(name, callback_data=f"route:{ticket}:{key}"))
+            if len(pair) == 2:
+                rows.append(pair)
+                pair = []
+        if pair:
+            rows.append(pair)
+        rows.append([InlineKeyboardButton("Отмена", callback_data=f"noop:{ticket}")])
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    # --- Направление в отдел (админ) ---
+    if data.startswith("route:"):
+        _, ticket, key = data.split(":", 2)
+        await assign_department(ticket, key)
+        dept = DEPARTMENTS.get(key) or {}
+        name = dept.get("name", key)
+        chat_id = dept.get("tg_chat_id")
+        row = await get_request_by_ticket(ticket)
+        if row:
+            _id, t, author_id, text, media_id, lat, lon, *_ = row
+            try:
+                if chat_id:
+                    if media_id:
+                        try:
+                            await context.bot.send_photo(chat_id=chat_id, photo=media_id, caption=f"Заявка {t} ({name})\n\n{text}")
+                        except Exception:
+                            await context.bot.send_message(chat_id=chat_id, text=f"Заявка {t} ({name})\n\n{text}")
+                    else:
+                        await context.bot.send_message(chat_id=chat_id, text=f"Заявка {t} ({name})\n\n{text}")
+                    if lat is not None and lon is not None:
+                        await context.bot.send_location(chat_id=chat_id, latitude=lat, longitude=lon)
+            except Exception as e:
+                log.warning("Не удалось отправить в отдел %s: %s", key, e)
+        try:
+            await query.edit_message_text(f"Заявка {ticket} направлена в отдел: {name}")
+        except BadRequest:
+            await context.bot.send_message(chat_id=query.message.chat_id, text=f"Заявка {ticket} направлена в отдел: {name}")
+        return
+
+    # --- Дальше: только админам ---
     admins = await list_admins()
     if user.id not in admins:
         await context.bot.send_message(chat_id=query.message.chat_id, text="Доступ запрещён.")
         return
-
-    data = query.data or ""
 
     # --- Рассылка: подтверждение/отмена ---
     if data == "broadcast:confirm":
@@ -856,7 +1125,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not payload:
             await context.bot.send_message(chat_id=query.message.chat_id, text="Нет текста для рассылки.")
             return
-        user_ids = await list_all_user_ids()  # <-- теперь читает id из users
+        user_ids = await list_all_user_ids()
         ok = 0
         fail = 0
         for uid in user_ids:
@@ -880,7 +1149,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=query.message.chat_id, text="Рассылка отменена.")
         return
 
-    # --- Открыть карточку заявки ---
+    # --- Опасные операции: подтверждения ---
+    if data == "danger:clean_active:confirm":
+        n = await cleanup_active_requests()
+        try:
+            await query.edit_message_text(f"Удалено активных заявок: {n}")
+        except BadRequest:
+            await context.bot.send_message(chat_id=query.message.chat_id, text=f"Удалено активных заявок: {n}")
+        return
+
+    if data == "danger:bulkclose_active:confirm":
+        n = await bulk_close_active_requests()
+        try:
+            await query.edit_message_text(f"Закрыто активных заявок: {n}")
+        except BadRequest:
+            await context.bot.send_message(chat_id=query.message.chat_id, text=f"Закрыто активных заявок: {n}")
+        return
+
+    if data == "danger:cancel":
+        try:
+            await query.edit_message_text("Операция отменена.")
+        except BadRequest:
+            await context.bot.send_message(chat_id=query.message.chat_id, text="Операция отменена.")
+        return
+
+    # --- Открыть карточку заявки (админ) ---
     if data.startswith("open:"):
         ticket = data.split(":", 1)[1]
         row = await get_request_by_ticket(ticket)
@@ -888,29 +1181,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=query.message.chat_id, text="Заявка не найдена.")
             return
 
-        _id, ticket, user_id, text, media_path, lat, lon, status, admin_comment, created, updated = row
-
         replies = await list_replies(ticket)
-        replies_block = ""
-        if replies:
-            last = replies[-1]
-            rtext, rtime = last[1], last[2]
-            replies_block = f"\n\nПоследний ответ: {rtext}\n({rtime})"
-
+        last = replies[-1] if replies else None
         dialog_info = ACTIVE_DIALOGS_BY_TICKET.get(ticket)
-        dialog_line = ""
-        if dialog_info:
-            dialog_line = f"\nДиалог: 🟢 активен (оператор {dialog_info['admin_id']})"
+        msg = ticket_card_for_admin(row, dialog_info=dialog_info, last_reply=last)
 
-        msg = (
-            f"Заявка {ticket}\n"
-            f"Автор: {user_id}\n"
-            f"Создана: {created}\n"
-            f"Статус: {status}{dialog_line}\n"
-            f"Текст:\n{text}{replies_block}"
-        )
-
-        if status in ("Завершено", "Отклонено"):
+        if row[7] in ("Завершено", "Отклонено"):
             buttons = InlineKeyboardMarkup([
                 [InlineKeyboardButton("Ответить пользователю", callback_data=f"reply:{ticket}")]
             ])
@@ -924,6 +1200,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buttons = InlineKeyboardMarkup([
                 dialog_row,
                 [InlineKeyboardButton("Ответить (разово)", callback_data=f"reply:{ticket}")],
+                [InlineKeyboardButton("Направить в отдел", callback_data=f"route_menu:{ticket}")],
                 [InlineKeyboardButton("Завершено", callback_data=f"status:{ticket}:Завершено"),
                  InlineKeyboardButton("Отклонено", callback_data=f"status:{ticket}:Отклонено")]
             ])
@@ -931,14 +1208,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_obj = query.message
         try:
             if msg_obj and (msg_obj.photo or msg_obj.video or msg_obj.document):
-                await msg_obj.reply_text(msg, reply_markup=buttons)
+                await msg_obj.reply_text(msg, reply_markup=buttons, parse_mode="HTML")
             else:
-                await query.edit_message_text(msg, reply_markup=buttons)
+                await query.edit_message_text(msg, reply_markup=buttons, parse_mode="HTML")
         except BadRequest:
-            await context.bot.send_message(chat_id=query.message.chat_id, text=msg, reply_markup=buttons)
+            await context.bot.send_message(chat_id=query.message.chat_id, text=msg, reply_markup=buttons, parse_mode="HTML")
         return
 
-    # --- РЕЖИМ ДИАЛОГА: старт/стоп ---
+    # --- ДИАЛОГ: старт/стоп ---
     if data.startswith("dialog:start:"):
         ticket = data.split(":", 2)[2]
         row = await get_request_by_ticket(ticket)
@@ -960,7 +1237,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await context.bot.send_message(
             chat_id=query.message.chat_id,
-            text=f"Диалог по заявке {ticket} включён. Пишите сообщения — они уйдут автору.\nНажмите «Завершить диалог», когда уточнения будут собраны."
+            text=f"Диалог по заявке {ticket} включён. Пишите сообщения — они уйдут автору.\nНажмите «Завершить диалог», когда уточнения будут собраны.",
+            reply_markup=admin_dialog_inline_keyboard(ticket)
         )
         try:
             await context.bot.send_message(
@@ -1009,21 +1287,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update_status(ticket, status=new_status)
 
-        if new_status in ("Завершено", "Отклонено"):
-            info = ACTIVE_DIALOGS_BY_TICKET.pop(ticket, None)
-            if info:
-                admin_id = info["admin_id"]
-                user_id = info["user_id"]
-                if ACTIVE_DIALOGS_BY_ADMIN.get(admin_id) == ticket:
-                    ACTIVE_DIALOGS_BY_ADMIN.pop(admin_id, None)
-                if ACTIVE_DIALOGS_BY_USER.get(user_id) == ticket:
-                    ACTIVE_DIALOGS_BY_USER.pop(user_id, None)
-
+        # Уведомим автора
         row = await get_request_by_ticket(ticket)
         if row:
-            _id, ticket, user_id, *_ = row
+            _id, ticket, user_id_author, *_ = row
             try:
-                await context.bot.send_message(chat_id=user_id, text=f"Статус вашей заявки {ticket} изменён: {new_status}")
+                await context.bot.send_message(chat_id=user_id_author, text=f"Статус вашей заявки {ticket} изменён: {new_status}")
             except Exception as e:
                 log.warning("Не удалось уведомить автора о статусе: %s", e)
 
@@ -1043,14 +1312,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=query.message.chat_id, text=f"Введите текст ответа для заявки {ticket} (разовый).")
         return
 
-# ======= ERROR HANDLER =======
+# ========= ERROR HANDLER =========
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logging.exception("Exception while handling update:", exc_info=context.error)
 
-# ======= ЗАПУСК =======
+# ========= STARTUP =========
 async def on_startup(app):
     await init_db()
     Path(FILES_DIR).mkdir(parents=True, exist_ok=True)
+    # Подсказки команд в меню Telegram
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start", "Запуск и главное меню"),
+            BotCommand("admin", "Получить права администратора"),
+            BotCommand("export", "Экспорт отчёта (admin)"),
+            BotCommand("cleanup", "Очистка заявок (admin)"),
+            BotCommand("bulkclose", "Закрыть активные (admin)"),
+            BotCommand("broadcast", "Массовая рассылка (admin)"),
+        ])
+    except Exception as e:
+        log.warning("set_my_commands failed: %s", e)
     log.info("DB ready. Files dir: %s", FILES_DIR)
 
 def main():
@@ -1064,7 +1345,7 @@ def main():
     app.add_handler(CommandHandler("bulkclose", bulkclose_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
 
-    # Инлайн-кнопки (админские)
+    # Инлайн-кнопки
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     # Любые сообщения в личке — общий обработчик
