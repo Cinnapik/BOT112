@@ -26,31 +26,26 @@ FILES_DIR = str(BASE_DIR / "files")
 
 # ==== Маршрутизация по отделам ====
 DEPARTMENTS = {
-    "police": {"name": "Полиция", "tg_chat_id": None},
-    "fire": {"name": "Пожарная часть", "tg_chat_id": None},
-    "housing": {"name": "Отдел ЖКХ", "tg_chat_id": None},
-    "roads": {"name": "Дороги", "tg_chat_id": None},
-    "lighting": {"name": "Освещение", "tg_chat_id": None},
-    "water": {"name": "Водоканал", "tg_chat_id": None},
-    "gas": {"name": "Газовая служба", "tg_chat_id": None},
-    "heat": {"name": "Теплосети", "tg_chat_id": None},
-    "emergency": {"name": "Гражданская защита/МЧС", "tg_chat_id": None},
+    "police": {"name": "Полиция", "tg_chat_id": -1003434460179},
+    "fire": {"name": "Пожарная часть", "tg_chat_id": -1003434460179},
+    "housing": {"name": "Отдел ЖКХ", "tg_chat_id": -1003434460179},
+    "roads": {"name": "Дороги", "tg_chat_id": -1003434460179},
+    "lighting": {"name": "Освещение", "tg_chat_id": -1003434460179},
+    "water": {"name": "Водоканал", "tg_chat_id": -1003434460179},
+    "gas": {"name": "Газовая служба", "tg_chat_id": -1003434460179},
+    "heat": {"name": "Теплосети", "tg_chat_id": -1003434460179},
+    "emergency": {"name": "Гражданская защита/МЧС", "tg_chat_id": -1003434460179},
 }
 
 CATEGORY_TO_DEPT = {
-    "police": "police",
-    "fire": "fire",
     "housing": "housing",
     "roads": "roads",
     "lighting": "lighting",
     "water": "water",
-    "gas": "gas",
     "heat": "heat",
-    "emerg_fire": "fire",
-    "emerg_murder": "police",
-    "emerg_bomb": "police",
-    "emerg_flood": "emergency",
-    "emerg_uav": "emergency",
+    "gas": "gas",
+    "police": "police",
+    "fire": "fire",
 }
 
 EMERGENCY_ROUTE = {
